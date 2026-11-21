@@ -1,7 +1,12 @@
+import math
+
 import torch
 import torch.nn as nn
-import math
-from cuda.binding import strided_attention_forward # This will be our compiled CUDA kernel
+
+from cuda.binding import (
+    strided_attention_forward,  # This will be our compiled CUDA kernel
+)
+
 
 def naive_strided_attention(q, k, v, stride):
     """
@@ -13,10 +18,10 @@ def naive_strided_attention(q, k, v, stride):
         stride: The stride for sparse attention.
     """
     batch_size, num_heads, seq_len, head_dim = q.shape
-    
+
     # Create an empty output tensor
     output = torch.zeros_like(q)
-    
+
     # Scale factor for dot products
     scale = 1.0 / math.sqrt(head_dim)
 
@@ -44,7 +49,7 @@ def naive_strided_attention(q, k, v, stride):
             exps = torch.exp(shifted)
             sums = exps.sum(dim=-1, keepdim=True) + 1e-6
             weights = exps / sums
-            
+
             # --- Weighted Sum of Values ---
             out_bh = torch.matmul(weights, v_bh)  # shape [seq_len, head_dim]
             output[b, h] = out_bh
@@ -62,7 +67,7 @@ class CustomStridedAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
         self.stride = stride
-        
+
         assert self.head_dim * num_heads == self.embed_dim, "embed_dim must be divisible by num_heads"
 
         self.qkv_proj = nn.Linear(embed_dim, embed_dim * 3)
@@ -80,9 +85,11 @@ class CustomStridedAttention(nn.Module):
 
         # TODO: Replace the call to the naive implementation below with a call
         # to your custom CUDA kernel `strided_attention_forward`.
- 
-        # Using the naive implementation as a placeholder.
-        output = naive_strided_attention(q, k, v, self.stride)
+
+        # The CUDA kernel indexes contiguous (batch, head, token, feature) tensors.
+        output = strided_attention_forward(
+            q.contiguous(), k.contiguous(), v.contiguous(), self.stride
+        )
 
         # Reshape and project the output back to the original shape
         output = output.permute(0, 2, 1, 3).contiguous()
