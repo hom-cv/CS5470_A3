@@ -64,17 +64,31 @@ __global__ void strided_attention_forward_kernel(
     //    - Each thread can compute a partial dot product and then you can use
     //      a parallel reduction (e.g., using shared memory and `__syncthreads()`)
     //      to get the final score.
-    // Each active thread computes a score for key 0, stride, 2*stride, ... .
-    T score = -INFINITY;
+    // A warp is a group of 32 threads. Each warp works on one key at a time,
+    // so neighboring threads read neighboring features of that key.
+    const int lane = tid % 32;
+    const int warp_id = tid / 32;
+    const int num_warps = blockDim.x / 32;
+    const T scale = T(1) / sqrt(static_cast<T>(head_dim));
 
-    if (tid < num_keys) {
-        const int64_t key_offset = head_offset + static_cast<int64_t>(tid) * stride * head_dim;
+    for (int j = warp_id; j < num_keys; j += num_warps) {
+        const int64_t key_offset = head_offset + static_cast<int64_t>(j) * stride * head_dim;
         T dot = 0;
-        for (int d = 0; d < head_dim; ++d) {
+        for (int d = lane; d < head_dim; d += 32) {
             dot += query[d] * k_ptr[key_offset + d];
         }
-        score = dot / sqrt(static_cast<T>(head_dim));
+        // Exchange partial sums within the warp. All 32 lanes participate,
+        // including lanes with no features (whose partial sum is zero).
+        for (int offset = 16; offset > 0; offset /= 2) {
+            dot += __shfl_down_sync(0xffffffff, dot, offset);
+        }
+        if (lane == 0) {
+            weights[j] = dot * scale;
+        }
     }
+    __syncthreads();
+    // Temporarily use weights for scores; step 4 replaces them with probabilities.
+    const T score = tid < num_keys ? weights[tid] : T(-INFINITY);
 
     // 4. Compute Softmax.
     //    - Find the maximum score among the strided scores (for numerical stability). This is another parallel reduction.
